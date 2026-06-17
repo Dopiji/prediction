@@ -1,0 +1,9 @@
+.env
+*.db
+__pycache__/
+.venv/
+*.pyc
+cloudflared
+cf.log
+run.sh
+.DS_Store
