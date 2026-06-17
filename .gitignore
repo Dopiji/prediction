@@ -7,3 +7,4 @@ cloudflared
 cf.log
 run.sh
 .DS_Store
+predict.db.bak_*
