@@ -241,7 +241,7 @@ function renderMarkets(){
         <div class="opt ${closed?'dis':''}" ${closed?'':`onclick="openSheet(${m.id},'${o.side}')"`}>
           <div class="orow"><span class="olabel">${esc(o.label)}</span><span class="opct">${o.p}%</span></div>
           <div class="otrack"><div class="ofill" style="width:${o.p}%"></div></div>
-          ${o.pos?`<div class="opos">твоя ставка: ${fmt(o.pos)}</div>`:''}
+          ${o.pos?`<div class="opos">твои доли: ${fmt(o.pos)} → выигрыш ${fmt(o.pos)}</div>`:''}
         </div>`).join('')+`</div>`;
     } else {
       const pos=m.pos||{yes:0,no:0};
@@ -251,7 +251,7 @@ function renderMarkets(){
         <button class="pbtn yes" ${closed?"disabled":""} onclick="openSheet(${m.id},'YES')"><span class="s">Да</span><span class="p">${m.p_yes}¢</span></button>
         <button class="pbtn no" ${closed?"disabled":""} onclick="openSheet(${m.id},'NO')"><span class="s">Нет</span><span class="p">${m.p_no}¢</span></button>
       </div>
-      ${(pos.yes||pos.no)?`<div class="pos">${pos.yes?`<span style="color:var(--yes)">▲ Да ${fmt(pos.yes)}</span>`:""}${pos.no?`<span style="color:var(--no)">▼ Нет ${fmt(pos.no)}</span>`:""}</div>`:""}`;
+      ${(pos.yes||pos.no)?`<div class="pos">${pos.yes?`<span style="color:var(--yes)">▲ Да ${fmt(pos.yes)} долей</span>`:""}${pos.no?`<span style="color:var(--no)">▼ Нет ${fmt(pos.no)} долей</span>`:""}</div>`:""}`;
     }
     return `<div class="card ${live?"live":""}" style="animation-delay:${Math.min(i,8)*45}ms">
       <div class="ctop"><span class="tag">${esc(m.cat)}</span>${right}</div>
@@ -297,8 +297,10 @@ function renderMe(){
   $("bb").onclick=async()=>{const r=await api("/api/bonus");$("bm").textContent=r.message||"";if(r.ok){haptic("success");toast(r.message);await refresh();renderMe();}};
 }
 
-function sidePool(m,side){if(m.multi){const o=m.options.find(x=>x.side===side);return o?o.pool:0;}return side==="YES"?m.yes:m.no;}
+function sidePrice(m,side){if(m.multi){const o=m.options.find(x=>x.side===side);return o?o.pr:0.5;}return side==="YES"?m.pr_yes:m.pr_no;}
 function sideLabel(m,side){if(m.multi){const o=m.options.find(x=>x.side===side);return o?o.label:side;}return side==="YES"?"Да":"Нет";}
+// LMSR: сколько долей даёт ставка a фантиков при цене p и ликвидности b
+function lmsrShares(a,p,b){if(a<=0||p<=0)return 0;const ex=Math.exp(Math.min(a/b,650));const v=(ex-1+p)/p;return v>0?b*Math.log(v):0;}
 window.openSheet=(id,side)=>{
   curM=ST.markets.find(x=>x.id===id);curSide=side;
   const label=sideLabel(curM,side);
@@ -309,8 +311,8 @@ window.openSheet=(id,side)=>{
   $("sheet").classList.add("show");
 };
 function calc(){const a=parseInt($("sh-amt").value,10)||0;if(!a||!curM){$("sh-pay").textContent="—";return;}
-  const sp=sidePool(curM,curSide);const k=(curM.pool+a)/(sp+a);
-  $("sh-pay").innerHTML=`${fmt(a*k)} <span style="color:var(--muted);font-size:13px">×${k.toFixed(2)}</span>`;}
+  const p=sidePrice(curM,curSide);const sh=lmsrShares(a,p,curM.b||4000);const k=sh/a;
+  $("sh-pay").innerHTML=`${fmt(sh)} <span style="color:var(--muted);font-size:13px">долей · ×${k.toFixed(2)} если зайдёт</span>`;}
 $("sh-amt").oninput=calc;
 document.querySelectorAll(".chip").forEach(c=>c.onclick=()=>{$("sh-amt").value=c.dataset.a==="max"?ST.me.balance:c.dataset.a;calc();});
 $("sheet").onclick=e=>{if(e.target.id==="sheet")$("sheet").classList.remove("show");};

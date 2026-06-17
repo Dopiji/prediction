@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
@@ -57,6 +58,12 @@ WEBAPP_INDEX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp"
 ASSETS = [("BTC", "BTC-USDT"), ("ETH", "ETH-USDT"), ("TON", "TON-USDT"), ("SOL", "SOL-USDT")]
 HORIZONS = [5, 10]
 PRICE_SEED = 1500
+# Авто-генерация коротких рынков «Курс ⚡». По умолчанию ВЫКЛ — они засоряли
+# ленту стеной 50/50. Включить: ENABLE_PRICE_MARKETS=1 в окружении.
+ENABLE_PRICE_MARKETS = os.getenv("ENABLE_PRICE_MARKETS", "0") == "1"
+# Ликвидность LMSR-маркетмейкера (как у Polymarket): чем больше, тем меньше
+# двигается цена от одной ставки. Цена = вероятность, исходы суммируются в 100%.
+LMSR_B = float(os.getenv("LMSR_B", "4000"))
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
@@ -91,7 +98,12 @@ CREATE TABLE IF NOT EXISTS markets (
 CREATE TABLE IF NOT EXISTS bets (
     id INTEGER PRIMARY KEY AUTOINCREMENT, market_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
     side TEXT NOT NULL, amount INTEGER NOT NULL, created_at TEXT NOT NULL,
-    settled INTEGER NOT NULL DEFAULT 0, payout INTEGER NOT NULL DEFAULT 0
+    settled INTEGER NOT NULL DEFAULT 0, payout INTEGER NOT NULL DEFAULT 0,
+    shares REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS amm (
+    market_id INTEGER NOT NULL, side TEXT NOT NULL, q REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (market_id, side)
 );
 """
 
@@ -104,6 +116,7 @@ MIGRATIONS = [
     "ALTER TABLE markets ADD COLUMN seed_yes INTEGER NOT NULL DEFAULT 1000",
     "ALTER TABLE markets ADD COLUMN seed_no INTEGER NOT NULL DEFAULT 1000",
     "ALTER TABLE markets ADD COLUMN options TEXT",
+    "ALTER TABLE bets ADD COLUMN shares REAL NOT NULL DEFAULT 0",
 ]
 
 
@@ -175,26 +188,83 @@ def market_sides(m) -> list[tuple[str, str, int]]:
     return [("YES", "Да", m["seed_yes"] or 0), ("NO", "Нет", m["seed_no"] or 0)]
 
 
-async def real_pools(market_id: int) -> dict[str, int]:
-    cur = await db.execute("SELECT side, COALESCE(SUM(amount),0) AS s FROM bets WHERE market_id=? GROUP BY side", (market_id,))
-    return {r["side"]: r["s"] for r in await cur.fetchall()}
+# --------------------------------------------------------------------------- #
+#  LMSR-маркетмейкер (как у Polymarket): цена = вероятность, исходы = 100%
+# --------------------------------------------------------------------------- #
+def lmsr_prices(q: dict[str, float]) -> dict[str, float]:
+    """Цены исходов (0..1) из вектора долей q. Сумма = 1."""
+    if not q:
+        return {}
+    xs = {s: v / LMSR_B for s, v in q.items()}
+    mx = max(xs.values())                       # сдвиг от переполнения exp
+    es = {s: math.exp(x - mx) for s, x in xs.items()}
+    tot = sum(es.values()) or 1.0
+    return {s: e / tot for s, e in es.items()}
 
 
-async def pool_map(m) -> dict[str, int]:
-    real = await real_pools(m["id"])
-    return {side: seed + real.get(side, 0) for side, _, seed in market_sides(m)}
+def lmsr_shares(q: dict[str, float], side: str, spend: float) -> float:
+    """Сколько долей даёт ставка `spend` фантиков на `side` (стоимость ровно spend)."""
+    if spend <= 0 or side not in q:
+        return 0.0
+    xs = {s: v / LMSR_B for s, v in q.items()}
+    mx = max(xs.values())
+    es = {s: math.exp(x - mx) for s, x in xs.items()}
+    B = es[side]
+    A = sum(e for s, e in es.items() if s != side)
+    # spend = b·ln((B·e^{Δ/b}+A)/(B+A))  →  Δ = b·ln((e^{spend/b}·(A+B) − A)/B)
+    ex = math.exp(min(spend / LMSR_B, 650.0))
+    num = ex * (A + B) - A
+    if num <= 0:
+        return 0.0
+    return LMSR_B * math.log(num / B)
+
+
+def pct_round(prices: dict[str, float]) -> dict[str, int]:
+    """Округление до целых процентов с гарантией суммы 100 (наиб. остаток)."""
+    if not prices:
+        return {}
+    raw = {s: p * 100 for s, p in prices.items()}
+    out = {s: int(v) for s, v in raw.items()}
+    rem = 100 - sum(out.values())
+    for s in sorted(raw, key=lambda s: raw[s] - out[s], reverse=True)[:max(rem, 0)]:
+        out[s] += 1
+    return out
+
+
+async def amm_state(m) -> dict[str, float]:
+    """Вектор долей q по исходам. Инициализируется из seed-ов (цена = доля seed)."""
+    cur = await db.execute("SELECT side, q FROM amm WHERE market_id=?", (m["id"],))
+    q = {r["side"]: r["q"] for r in await cur.fetchall()}
+    missing = [(c, seed) for c, _, seed in market_sides(m) if c not in q]
+    if missing:
+        for c, seed in missing:
+            qv = LMSR_B * math.log(max(int(seed), 1))
+            await db.execute("INSERT OR REPLACE INTO amm(market_id, side, q) VALUES (?,?,?)", (m["id"], c, qv))
+            q[c] = qv
+        await db.commit()
+    return q
+
+
+async def market_prices(m) -> dict[str, float]:
+    return lmsr_prices(await amm_state(m))
+
+
+async def market_pcts(m) -> dict[str, int]:
+    return pct_round(await market_prices(m))
+
+
+async def market_volume(market_id: int) -> int:
+    cur = await db.execute("SELECT COALESCE(SUM(amount),0) AS s FROM bets WHERE market_id=?", (market_id,))
+    return (await cur.fetchone())["s"]
 
 
 async def user_position(market_id: int, user_id: int) -> dict[str, int]:
+    """Доли пользователя по исходам (= потенциальный выигрыш, 1 доля = 1 фантик)."""
     cur = await db.execute(
-        "SELECT side, COALESCE(SUM(amount),0) AS s FROM bets WHERE market_id=? AND user_id=? GROUP BY side", (market_id, user_id)
+        "SELECT side, COALESCE(SUM(shares),0) AS s FROM bets WHERE market_id=? AND user_id=? AND settled=0 GROUP BY side",
+        (market_id, user_id),
     )
-    return {r["side"]: r["s"] for r in await cur.fetchall()}
-
-
-def pcts(pm: dict[str, int]) -> dict[str, int]:
-    total = sum(pm.values()) or 1
-    return {s: round(v * 100 / total) for s, v in pm.items()}
+    return {r["side"]: round(r["s"]) for r in await cur.fetchall()}
 
 
 # --------------------------------------------------------------------------- #
@@ -214,9 +284,15 @@ async def do_place_bet(user_id: int, market_id: int, side: str, amount: int) -> 
         return False, "Рынок закрыт."
     if m["closes_at"] and datetime.fromisoformat(m["closes_at"]) <= now():
         return False, "Время вышло."
+    q = await amm_state(m)
+    shares = lmsr_shares(q, side, amount)
+    if shares <= 0:
+        return False, "Слишком маленькая ставка."
+    q[side] += shares
     await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, user_id))
-    await db.execute("INSERT INTO bets (market_id, user_id, side, amount, created_at) VALUES (?,?,?,?,?)",
-                     (market_id, user_id, side, amount, now_iso()))
+    await db.execute("UPDATE amm SET q = ? WHERE market_id = ? AND side = ?", (q[side], market_id, side))
+    await db.execute("INSERT INTO bets (market_id, user_id, side, amount, shares, created_at) VALUES (?,?,?,?,?,?)",
+                     (market_id, user_id, side, amount, shares, now_iso()))
     await db.commit()
     return True, "ok"
 
@@ -290,8 +366,7 @@ async def admin_give(target: str, amount: int) -> tuple[bool, str, int | None]:
 
 async def resolve_market(market_id: int, outcome: str) -> dict[int, list[int]]:
     """outcome: код исхода (YES/NO/OPTi) или CANCEL. Возвращает {uid: [staked, payout]}."""
-    m = await get_market(market_id)
-    cur = await db.execute("SELECT id, user_id, side, amount FROM bets WHERE market_id=? AND settled=0", (market_id,))
+    cur = await db.execute("SELECT id, user_id, side, amount, shares FROM bets WHERE market_id=? AND settled=0", (market_id,))
     bets = await cur.fetchall()
     res: dict[int, list[int]] = {}
     for b in bets:
@@ -303,11 +378,9 @@ async def resolve_market(market_id: int, outcome: str) -> dict[int, list[int]]:
             await db.execute("UPDATE bets SET settled=1, payout=? WHERE id=?", (b["amount"], b["id"]))
         await db.execute("UPDATE markets SET status='cancelled', resolved_at=? WHERE id=?", (now_iso(), market_id))
     else:
-        pm = await pool_map(m)
-        total = sum(pm.values())
-        win_pool = pm.get(outcome, 0)
+        # Выигравшая доля платит ровно 1 фантик; проигравшая — 0.
         for b in bets:
-            pay = (b["amount"] * total // win_pool) if (b["side"] == outcome and win_pool > 0) else 0
+            pay = round(b["shares"]) if b["side"] == outcome else 0
             if pay:
                 res[b["user_id"]][1] += pay
             await db.execute("UPDATE bets SET settled=1, payout=? WHERE id=?", (pay, b["id"]))
@@ -390,7 +463,8 @@ async def market_maker(bot: Bot) -> None:
     while True:
         try:
             await resolve_expired_price_markets(bot)
-            await ensure_short_term_markets()
+            if ENABLE_PRICE_MARKETS:
+                await ensure_short_term_markets()
         except Exception as e:
             logging.warning("market_maker: %s", e)
         await asyncio.sleep(25)
@@ -408,16 +482,17 @@ async def market_card(market_id: int, user_id: int | None = None) -> str:
     m = await get_market(market_id)
     if not m:
         return "Рынок не найден."
-    pm = await pool_map(m)
-    pp = pcts(pm)
+    pp = await market_pcts(m)
+    prices = await market_prices(m)
     sides = market_sides(m)
-    total = sum(pm.values())
+    total = await market_volume(market_id)
     lines = [f"<b>{m['question']}</b>", "", f"💰 Объём: {usd(total)}", ""]
     pos = await user_position(market_id, user_id) if user_id is not None else {}
     for code, label, _ in sides:
         mine = pos.get(code, 0)
-        extra = f"  · ты: {mine}" if mine else ""
-        lines.append(f"{label} — <b>{pp.get(code,0)}%</b>{extra}")
+        extra = f"  · твои доли: {mine} (≈ {mine} выигрыш)" if mine else ""
+        cents = round(prices.get(code, 0) * 100)
+        lines.append(f"{label} — <b>{pp.get(code,0)}%</b> · {cents}¢{extra}")
     if m["status"] == "resolved":
         win = next((l for c, l, _ in sides if c == m["outcome"]), m["outcome"])
         lines += ["", f"Итог: <b>{win}</b>"]
@@ -858,19 +933,20 @@ async def api_auth(request: web.Request) -> tuple[dict | None, dict]:
 
 async def market_json(market_id: int, user_id: int | None = None) -> dict:
     m = await get_market(market_id)
-    pm = await pool_map(m)
-    pp = pcts(pm)
-    total = sum(pm.values())
+    prices = await market_prices(m)
+    pp = pct_round(prices)
+    total = await market_volume(market_id)
     pos = await user_position(market_id, user_id) if user_id is not None else {}
     sides = market_sides(m)
     out = {"id": m["id"], "question": m["question"], "cat": m["category"], "status": m["status"],
            "kind": m["kind"], "closes_at": m["closes_at"], "pool": total, "vol_usd": usd(total),
-           "multi": m["kind"] == "multi",
-           "options": [{"side": c, "label": l, "p": pp.get(c, 0), "pool": pm.get(c, 0), "pos": pos.get(c, 0)}
-                       for c, l, _ in sides]}
+           "b": LMSR_B, "multi": m["kind"] == "multi",
+           "options": [{"side": c, "label": l, "p": pp.get(c, 0),
+                        "pr": round(prices.get(c, 0), 6), "cents": round(prices.get(c, 0) * 100),
+                        "pos": pos.get(c, 0)} for c, l, _ in sides]}
     if m["kind"] != "multi":
-        out.update({"yes": pm.get("YES", 0), "no": pm.get("NO", 0),
-                    "p_yes": pp.get("YES", 0), "p_no": pp.get("NO", 0),
+        out.update({"p_yes": pp.get("YES", 0), "p_no": pp.get("NO", 0),
+                    "pr_yes": round(prices.get("YES", 0), 6), "pr_no": round(prices.get("NO", 0), 6),
                     "pos": {"yes": pos.get("YES", 0), "no": pos.get("NO", 0)}})
     return out
 
@@ -994,6 +1070,13 @@ async def main():
                     await db.executescript(f.read())
         await db.commit()
         logging.info("Seeded markets from SQL files")
+
+    # Если авто-рынки «Курс ⚡» выключены — вычищаем уже наплодившиеся,
+    # чтобы лента не была завалена стеной 50/50.
+    if not ENABLE_PRICE_MARKETS:
+        await db.execute("DELETE FROM bets WHERE market_id IN (SELECT id FROM markets WHERE kind='price')")
+        await db.execute("DELETE FROM markets WHERE kind='price'")
+        await db.commit()
 
     global bot_ref
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
