@@ -51,7 +51,7 @@ SUB_CHANNEL_URL = os.getenv("SUB_CHANNEL_URL", "https://t.me/testimpolimarpodpiv
 MSK = timezone(timedelta(hours=3))
 DB_PATH = os.getenv("DB_PATH", "predict.db")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
-API_PORT = int(os.getenv("API_PORT", "8080"))
+API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "8080")))
 WEBAPP_INDEX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp", "index.html")
 
 ASSETS = [("BTC", "BTC-USDT"), ("ETH", "ETH-USDT"), ("TON", "TON-USDT"), ("SOL", "SOL-USDT")]
