@@ -58,9 +58,9 @@ WEBAPP_INDEX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp"
 ASSETS = [("BTC", "BTC-USDT"), ("ETH", "ETH-USDT"), ("TON", "TON-USDT"), ("SOL", "SOL-USDT")]
 HORIZONS = [5, 10]
 PRICE_SEED = 1500
-# Авто-генерация коротких рынков «Курс ⚡». По умолчанию ВЫКЛ — они засоряли
-# ленту стеной 50/50. Включить: ENABLE_PRICE_MARKETS=1 в окружении.
-ENABLE_PRICE_MARKETS = os.getenv("ENABLE_PRICE_MARKETS", "0") == "1"
+# Авто-генерация коротких рынков «Курс ⚡». ВКЛ по умолчанию — цены живые (LMSR),
+# двигаются от ставок. Отключить: ENABLE_PRICE_MARKETS=0 в окружении.
+ENABLE_PRICE_MARKETS = os.getenv("ENABLE_PRICE_MARKETS", "1") == "1"
 # Ликвидность LMSR-маркетмейкера (как у Polymarket): чем больше, тем меньше
 # двигается цена от одной ставки. Цена = вероятность, исходы суммируются в 100%.
 LMSR_B = float(os.getenv("LMSR_B", "4000"))
@@ -253,9 +253,11 @@ async def market_pcts(m) -> dict[str, int]:
     return pct_round(await market_prices(m))
 
 
-async def market_volume(market_id: int) -> int:
-    cur = await db.execute("SELECT COALESCE(SUM(amount),0) AS s FROM bets WHERE market_id=?", (market_id,))
-    return (await cur.fetchone())["s"]
+async def market_volume(m) -> int:
+    """Капитализация рынка: засеянная ликвидность + реальные ставки."""
+    base = sum(seed for _, _, seed in market_sides(m))
+    cur = await db.execute("SELECT COALESCE(SUM(amount),0) AS s FROM bets WHERE market_id=?", (m["id"],))
+    return base + (await cur.fetchone())["s"]
 
 
 async def user_position(market_id: int, user_id: int) -> dict[str, int]:
@@ -485,8 +487,8 @@ async def market_card(market_id: int, user_id: int | None = None) -> str:
     pp = await market_pcts(m)
     prices = await market_prices(m)
     sides = market_sides(m)
-    total = await market_volume(market_id)
-    lines = [f"<b>{m['question']}</b>", "", f"💰 Объём: {usd(total)}", ""]
+    total = await market_volume(m)
+    lines = [f"<b>{m['question']}</b>", "", f"💰 Капитализация: {usd(total)}", ""]
     pos = await user_position(market_id, user_id) if user_id is not None else {}
     for code, label, _ in sides:
         mine = pos.get(code, 0)
@@ -935,7 +937,7 @@ async def market_json(market_id: int, user_id: int | None = None) -> dict:
     m = await get_market(market_id)
     prices = await market_prices(m)
     pp = pct_round(prices)
-    total = await market_volume(market_id)
+    total = await market_volume(m)
     pos = await user_position(market_id, user_id) if user_id is not None else {}
     sides = market_sides(m)
     out = {"id": m["id"], "question": m["question"], "cat": m["category"], "status": m["status"],
