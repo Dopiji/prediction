@@ -981,6 +981,20 @@ async def main():
             pass
     await db.commit()
 
+    # Авто-сидинг рынков, если база пустая (диск на бесплатных хостингах
+    # эфемерный и стирается при каждом перезапуске — поэтому сеем при старте).
+    cur = await db.execute("SELECT COUNT(*) FROM markets")
+    (n_markets,) = await cur.fetchone()
+    if n_markets == 0:
+        base = os.path.dirname(os.path.abspath(__file__))
+        for fname in ("seed.sql", "multi_seed.sql"):
+            path = os.path.join(base, fname)
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    await db.executescript(f.read())
+        await db.commit()
+        logging.info("Seeded markets from SQL files")
+
     global bot_ref
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     bot_ref = bot
